@@ -19,8 +19,8 @@
 #include <ArduinoJson.h>
 
 // ===================== TELEGRAM BOT CONFIG =====================
-#define BOT_TOKEN "8593909927:AAGKEU7JYykm0mKHeNQq4PI22ZOuFSEABUE"
-#define CHAT_ID "8504966652"
+#define BOT_TOKEN ""
+#define CHAT_ID ""
 
 WiFiClientSecure secured_client;
 UniversalTelegramBot bot(BOT_TOKEN, secured_client);
@@ -39,8 +39,8 @@ unsigned long lastTelegramCheck = 0;
 const unsigned long telegramCheckInterval = 1000;
 
 // ===================== WIFI & WEB CONFIG =====================
-const char* sta_ssid = "esp8266 2.4Ghz";
-const char* sta_password = "Keenandra26";
+const char* sta_ssid = "";
+const char* sta_password = "";
 const char* ap_ssid = "SmartHome-Cal";
 const char* ap_password = "calibrate123";
 
@@ -111,9 +111,9 @@ float readVoltage(int pin, volatile float offset) {
 }
 
 // ===================== HBD CONFIGURATION =====================
-const int HBD_MONTH = 10;
-const int HBD_DAY = 2;
-const char* HBD_NAME = "FAREL";
+const int HBD_MONTH = ;
+const int HBD_DAY = ;
+const char* HBD_NAME = "";
 
 // ===================== RELAY CONFIGURATION =====================
 const char* SECURITY_PIN = "12345";
