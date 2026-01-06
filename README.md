@@ -44,3 +44,37 @@ Fitur estetika yang mengubah fungsi layar menjadi lampu tidur:
  * Akses Web: Buka browser dan ketik http://smarthome.local (mDNS) atau IP address yang muncul di layar saat startup.
 📝 Catatan Keamanan
 > Peringatan: Proyek ini melibatkan arus AC tegangan tinggi (PZEM). Pastikan semua sambungan terisolasi dengan baik. Penggunaan relay untuk beban induktif besar disarankan menggunakan tambahanced
+
+WIRING:
+TFT 2.8 inch
+GND     GND
+VCC     3.3
+CS      GPIO15
+RISET   GPIO4
+DC      GPIO2
+MOSI    GPIO23
+SCK     GPIO18
+LED     3.3
+MISO    GPIO19
+T_CS    GPIO5
+T_IRQ   GPIO21
+T_DIN   GPIO23
+T_OUT   GPIO18
+T_CLK   GPIO19
+
+RELAY:
+IN  GPIO27
+GND GND
+VCC 3.3/5
+
+PZEM 004T
+VCC   3.3
+TX    RX2 
+RX    TX2 
+GND   GND
+
+BMS 
+B- >>>GND
+B1 >>>R33k>>>GPIO32<<<R10K<<<GND
+B2 >>>R33K>>>GPIO33<<<R10K<<<GND
+B3 >>>R33K>>>GPIO33<<<R10K<<<GND
