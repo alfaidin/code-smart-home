@@ -1,0 +1,2016 @@
+
+// ==============================================================
+// SMART HOME SYSTEM - DUAL CORE OPTIMIZED (RTOS) + TFT AS LAMP
+// ESP32 + TFT + TOUCH + BMS + PZEM + WEB + TELEGRAM BOT + TFT NIGHT MODE
+// ==============================================================
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <XPT2046_Touchscreen.h>
+#include <PZEM004Tv30.h>
+#include <Preferences.h>
+#include <time.h>
+#include <ESPmDNS.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <ArduinoJson.h>
+
+// ===================== TELEGRAM BOT CONFIG =====================
+#define BOT_TOKEN "8593909927:AAGKEU7JYykm0mKHeNQq4PI22ZOuFSEABUE"
+#define CHAT_ID "8504966652"
+
+WiFiClientSecure secured_client;
+UniversalTelegramBot bot(BOT_TOKEN, secured_client);
+
+// ===================== TFT LAMP STATE =====================
+volatile bool tftLampMode = false;      // True if TFT is acting as a lamp
+volatile uint16_t tftLampColor = 0x0000; // Current color of the TFT lamp (black by default)
+
+// Telegram Bot Variables
+bool telegramBotEnabled = true;
+bool batteryDropWarning = false;
+bool batteryNotifications = true;
+unsigned long lastBatteryDropMessage = 0;
+const unsigned long batteryDropInterval = 60000;
+unsigned long lastTelegramCheck = 0;
+const unsigned long telegramCheckInterval = 1000;
+
+// ===================== WIFI & WEB CONFIG =====================
+const char* sta_ssid = "esp8266 2.4Ghz";
+const char* sta_password = "Keenandra26";
+const char* ap_ssid = "SmartHome-Cal";
+const char* ap_password = "calibrate123";
+
+WebServer server(80);
+Preferences preferences;
+String sta_ip = "";
+String ap_ip = "";
+
+// ===================== TIME SYSTEM =====================
+struct tm timeinfo;
+bool timeInitialized = false;
+bool ntpSynced = false;
+const char* ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 7 * 3600;
+const int daylightOffset_sec = 0;
+
+// ===================== SHARED VARIABLES (VOLATILE) =====================
+volatile float cell1 = 0, cell2 = 0, cell3 = 0, totalBatt = 0;
+volatile float pzemVoltage = 0, pzemCurrent = 0, pzemPower = 0;
+volatile float pzemEnergy = 0, pzemFreq = 0, pzemPF = 0;
+volatile bool relayState = false;
+volatile bool currentWiFiState = false;
+
+// Variabel Waktu
+volatile bool timeValid = false;
+volatile int currentDay = 0, currentMonth = 0, currentHour = 0, currentMinute = 0;
+volatile char timeStr[9] = "--:--:--";
+volatile char dateStr[9] = "--/--/--";
+volatile char dayStr[10] = "---";
+
+// ===================== HARDWARE PINS =====================
+#define TFT_CS 15
+#define TFT_DC 2
+#define TFT_RST 4
+#define TFT_MOSI 23
+#define TFT_SCLK 18
+#define TFT_MISO 19
+#define TOUCH_CS 5
+#define TOUCH_IRQ 21
+#define RELAY_PIN 27
+#define CELL1_PIN 32
+#define CELL2_PIN 33
+#define CELL3_PIN 34
+#define PZEM_RX_PIN 16
+#define PZEM_TX_PIN 17
+
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+XPT2046_Touchscreen ts(TOUCH_CS);
+PZEM004Tv30 pzem(Serial2, PZEM_RX_PIN, PZEM_TX_PIN);
+
+// ===================== BMS CONFIGURATION =====================
+float R1 = 33000.0;
+float R2 = 10000.0;
+float vref = 3.3;
+volatile float offset1 = 0.0, offset2 = 0.0, offset3 = 0.0;
+
+float readVoltage(int pin, volatile float offset) {
+  const int NUM_SAMPLES = 20;
+  long sum = 0;
+  for (int i = 0; i < NUM_SAMPLES; i++) {
+    sum += analogRead(pin);
+    delayMicroseconds(5);
+  }
+  int raw = sum / NUM_SAMPLES;
+  float vout = (raw / 4095.0) * vref;
+  float vin = vout * ((R1 + R2) / R2);
+  return vin + offset;
+}
+
+// ===================== HBD CONFIGURATION =====================
+const int HBD_MONTH = 10;
+const int HBD_DAY = 2;
+const char* HBD_NAME = "FAREL";
+
+// ===================== RELAY CONFIGURATION =====================
+const char* SECURITY_PIN = "12345";
+int relayStage = 0;
+String inputPIN = "";
+int maxInputLength = 8;
+unsigned long relayOnTime = 0;
+
+// ===================== UI & SYSTEM STATE =====================
+int currentScreen = 0;
+unsigned long lastTouchTime = 0;
+unsigned long lastUpdate = 0;
+bool screenNeedsRedraw = true;
+
+String oldTime = "", oldDate = "", oldDay = "";
+float oldVoltage = -1, oldCurrent = -1, oldPower = -1, oldEnergy = -1;
+float oldCell1 = -1, oldCell2 = -1, oldCell3 = -1, oldTotalBatt = -1;
+bool oldRelayState = false;
+bool lastWiFiState = false;
+unsigned long lastWiFiCheck = 0;
+unsigned long lastADCRead = 0;
+const unsigned long ADCReadInterval = 4000;
+
+// ===================== COLOR DEFINITIONS =====================
+#define BG_COLOR 0x0000
+#define PANEL_DARK 0x0841
+#define BORDER_LIGHT 0x39C7
+#define TEXT_WHITE 0xFFFF
+#define TEXT_BLACK 0x0000
+#define TEXT_GRAY 0x7BEF
+#define ACCENT_BLUE 0x001F
+#define ACCENT_GREEN 0x07E0
+#define ACCENT_YELLOW 0xFFE0
+#define ACCENT_ORANGE 0xFD20
+#define ACCENT_PURPLE 0x801F
+#define ACCENT_CYAN 0x07FF
+#define ACCENT_RED 0xF800
+
+// ===================== TFT LAMP COLORS (Full Screen Colors) =====================
+#define TFT_LAMP_WHITE 0xFFFF // White
+#define TFT_LAMP_RED   0xF800 // Red
+#define TFT_LAMP_GREEN 0x07E0 // Green
+#define TFT_LAMP_BLUE  0x001F // Blue
+#define TFT_LAMP_OFF   0x0000 // Black (screen off / night mode background)
+
+
+// ===================== TASK HANDLES =====================
+TaskHandle_t TaskSensorHandle;
+
+// ===================== FUNCTION PROTOTYPES =====================
+// Utility functions
+int getTextWidth(const String &text, int textSize);
+int centerTextX(const String &text, int x, int width, int textSize);
+
+// WiFi functions
+void setupWiFiDualMode();
+void checkAndUpdateWiFiIndicator();
+void drawWiFiIndicator();
+
+// Web server functions
+void setupWebServer();
+void handleRoot();
+void handleData();
+
+// Telegram Bot functions
+void setupTelegramBot();
+void handleTelegramMessages();
+void sendTelegramMessage(String message);
+void sendBatteryStatus();
+void sendPZEMStatus();
+void controlRelayViaTelegram(bool state);
+void handleBatteryNotifications();
+void handleBatteryDropWarning();
+String generateStatusMessage();
+String generateMenuMessage();
+String getBatteryNotificationStatus();
+
+// UI functions
+void animateGoogleLogo();
+void showStartupScreen();
+void drawCurrentScreen();
+void updateChangingData();
+void drawHomeScreen();
+void updateHomeScreen();
+void drawHBD(const char* name);
+void drawBMSScreen();
+void updateBMSScreen();
+void drawPowerScreen();
+void updatePowerScreen();
+void updatePowerValue(int x, int y, int w, int h, const String &value, uint16_t color);
+void updatePowerValueSmall(int x, int y, int w, int h, const String &value, uint16_t color);
+void drawRelayScreen();
+void updateRelayScreen();
+void drawRelayStage0_Button();
+void drawRelayStage1_Warning();
+void drawRelayStage2_PinInput();
+void drawKeypad();
+void drawKeypadButton(int x, int y, int w, int h, String label, bool special);
+void drawRelayStage3_Active();
+void drawScreenIndicators();
+
+// Touch functions
+void handleTouch();
+bool checkTouchArea(int tx, int ty, int x, int y, int w, int h);
+void processRelayTouch(int tx, int ty);
+
+// Calibration functions
+void handleSerialCalibration();
+void guideCalibration();
+
+// ADC Reading function
+void readADCValues();
+
+// TFT Lamp functions
+void activateTFTAsLamp(uint16_t color);
+void deactivateTFTAsLamp();
+void drawNightModeIndicator();
+
+// ===================== CORE 0: SENSOR & NETWORK (BACKGROUND) =====================
+void SensorTask(void * pvParameters) {
+    for(;;) {
+        server.handleClient();
+
+        float v_ac = pzem.voltage();
+        if (!isnan(v_ac)) {
+            pzemVoltage = v_ac;
+            pzemCurrent = pzem.current();
+            pzemPower = pzem.power();
+            pzemEnergy = pzem.energy();
+            pzemFreq = pzem.frequency();
+            pzemPF = pzem.pf();
+        }
+
+        struct tm timeinfo;
+        if (getLocalTime(&timeinfo)) {
+            timeValid = true;
+            currentDay = timeinfo.tm_mday;
+            currentMonth = timeinfo.tm_mon + 1;
+            currentHour = timeinfo.tm_hour;
+            currentMinute = timeinfo.tm_min;
+
+            strftime((char*)timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);
+            strftime((char*)dateStr, sizeof(dateStr), "%d/%m/%y", &timeinfo);
+            strftime((char*)dayStr, sizeof(dayStr), "%A", &timeinfo);
+        } else {
+            timeValid = false;
+            strcpy((char*)timeStr, "--:--:--");
+            strcpy((char*)dateStr, "--/--/--");
+            strcpy((char*)dayStr, "---");
+        }
+
+        currentWiFiState = (WiFi.status() == WL_CONNECTED);
+
+        if (telegramBotEnabled && millis() - lastTelegramCheck > telegramCheckInterval) {
+            handleTelegramMessages();
+            lastTelegramCheck = millis();
+        }
+
+        if (batteryNotifications) {
+            handleBatteryNotifications();
+            handleBatteryDropWarning();
+        }
+
+        handleSerialCalibration();
+        vTaskDelay(50 / portTICK_PERIOD_MS);
+    }
+}
+
+// ===================== SETUP =====================
+void setup() {
+    Serial.begin(115200);
+    Serial2.begin(9600, SERIAL_8N1, PZEM_RX_PIN, PZEM_TX_PIN);
+
+    preferences.begin("bms-cal", true);
+    offset1 = preferences.getFloat("o1", 0.0);
+    offset2 = preferences.getFloat("o2", 0.0);
+    offset3 = preferences.getFloat("o3", 0.0);
+    preferences.end();
+
+    pinMode(RELAY_PIN, OUTPUT);
+    digitalWrite(RELAY_PIN, LOW);
+    analogReadResolution(12);
+    analogSetAttenuation(ADC_11db);
+
+    SPI.begin();
+    tft.begin();
+    ts.begin();
+    tft.setRotation(1);
+
+    animateGoogleLogo();
+
+    setupWiFiDualMode();
+    setupWebServer();
+
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+    setupTelegramBot();
+
+    tft.fillScreen(BG_COLOR);
+    tft.setTextColor(TEXT_WHITE);
+    tft.setTextSize(2);
+    tft.setCursor(centerTextX("SMART HOME SYSTEM", 0, tft.width(), 2), 30);
+    tft.print("SMART HOME SYSTEM");
+
+    tft.setTextSize(1);
+    tft.setCursor(10, 70);
+    tft.print("WiFi AP SSID:");
+    tft.setTextSize(2);
+    tft.setCursor(10, 90);
+    tft.print(ap_ssid);
+
+    tft.setTextSize(1);
+    tft.setCursor(10, 120);
+    tft.print("WiFi AP Pass:");
+    tft.setTextSize(2);
+    tft.setCursor(10, 140);
+    tft.print(ap_password);
+
+    tft.setTextSize(1);
+    tft.setCursor(10, 170);
+    tft.print("AP IP:");
+    tft.setTextSize(2);
+    tft.setCursor(10, 190);
+    tft.print(WiFi.softAPIP().toString());
+
+    tft.setTextSize(1);
+    tft.setCursor(10, 220);
+    tft.print("TFT Lamp: /tft_white, /tft_off etc.");
+    tft.setCursor(10, 235);
+    tft.print("Telegram for control.");
+
+    delay(3000);
+
+    xTaskCreatePinnedToCore(SensorTask, "SensorTask", 10000, NULL, 1, &TaskSensorHandle, 0);
+
+    showStartupScreen();
+    lastTouchTime = millis();
+
+    Serial.println("=== Smart Home System Ready ===");
+    Serial.println("Web Interface: http://" + WiFi.softAPIP().toString());
+    Serial.println("Telegram Bot: " + String(telegramBotEnabled ? "Enabled" : "Disabled"));
+    Serial.println("Battery Notifications: " + String(batteryNotifications ? "ON" : "OFF"));
+    Serial.println("Serial commands for calibration: CAL1:X.XX (e.g., CAL1:4.20)");
+    Serial.println("Type 'ADCSHOW' to see current offsets.");
+    Serial.println("Type 'ADCRESET' to reset all offsets to 0.0.");
+    Serial.println("Type 'GUIDE' for calibration instructions");
+}
+
+// ===================== CORE 1: UI & TOUCH (MAIN LOOP) =====================
+void loop() {
+    // Jika mode lampu TFT aktif, jangan deteksi sentuhan atau update UI lainnya,
+    // kecuali untuk mematikan mode lampu jika ada sentuhan.
+    if (tftLampMode) {
+        static unsigned long lastTouch = 0;
+        if (ts.touched() && (millis() - lastTouch > 400)) {
+            TS_Point p = ts.getPoint();
+            p.x = map(p.x, 200, 3800, tft.width(), 0);
+            p.y = map(p.y, 200, 3800, tft.height(), 0);
+
+            if (p.z > 100) { // Jika ada sentuhan kuat
+                deactivateTFTAsLamp(); // Matikan mode lampu TFT
+                lastTouch = millis();
+                screenNeedsRedraw = true; // Paksa redraw UI utama
+                lastTouchTime = millis(); // Reset timeout
+            }
+        }
+    } else { // Jika mode lampu TFT TIDAK aktif, proses UI normal
+        handleTouch();
+
+        if (relayStage == 3 && relayOnTime > 0 && millis() - relayOnTime >= 2000) {
+            relayState = false;
+            digitalWrite(RELAY_PIN, LOW);
+            relayStage = 0;
+            relayOnTime = 0;
+            screenNeedsRedraw = true;
+        }
+
+        if (millis() - lastTouchTime > 60000 && currentScreen != 0) {
+            currentScreen = 0;
+            screenNeedsRedraw = true;
+            lastTouchTime = millis();
+        }
+
+        if (screenNeedsRedraw) {
+            drawCurrentScreen();
+            screenNeedsRedraw = false;
+            lastUpdate = millis();
+        } else if (millis() - lastUpdate > 100) {
+            updateChangingData();
+            lastUpdate = millis();
+        }
+    } // End if tftLampMode
+
+    if (millis() - lastWiFiCheck > 2000) {
+        checkAndUpdateWiFiIndicator();
+        lastWiFiCheck = millis();
+    }
+
+    if (millis() - lastADCRead > ADCReadInterval) {
+        readADCValues();
+        lastADCRead = millis();
+    }
+
+    delay(10);
+}
+
+// Fungsi untuk membaca nilai ADC (dipanggil di Core 1)
+void readADCValues() {
+    float v1_raw = readVoltage(CELL1_PIN, offset1);
+    float v2_raw = readVoltage(CELL2_PIN, offset2);
+    float v3_raw = readVoltage(CELL3_PIN, offset3);
+
+    cell1 = v1_raw;
+    cell2 = max(0.0f, v2_raw - v1_raw);
+    cell3 = max(0.0f, v3_raw - v2_raw);
+    totalBatt = v3_raw;
+}
+
+// ===================== TELEGRAM BOT FUNCTIONS =====================
+void setupTelegramBot() {
+    secured_client.setCACert(TELEGRAM_CERTIFICATE_ROOT);
+
+    Serial.println("Setting up Telegram Bot...");
+
+    String startupMsg = "Smart Home System Started!\n";
+    startupMsg += "IP Address: " + WiFi.localIP().toString() + "\n";
+    startupMsg += "Time: " + String((char*)timeStr) + "\n";
+    startupMsg += "Battery Notifications: ";
+    startupMsg += (batteryNotifications ? "ON\n" : "OFF\n");
+
+    startupMsg += "Battery Drop Warnings: ";
+    startupMsg += (batteryNotifications ? "ACTIVE\n" : "INACTIVE\n");
+
+    sendTelegramMessage(startupMsg);
+}
+
+void handleTelegramMessages() {
+    if (!telegramBotEnabled) return;
+
+    int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+
+    while (numNewMessages) {
+        Serial.println("Got Telegram message");
+
+        for (int i = 0; i < numNewMessages; i++) {
+            String chat_id = bot.messages[i].chat_id;
+            String text = bot.messages[i].text;
+
+            Serial.println("Message: " + text);
+
+            if (chat_id != CHAT_ID) {
+                Serial.println("Unauthorized chat ID: " + chat_id);
+                continue;
+            }
+
+            // TFT LAMP COMMANDS
+            if (text == "/tft_white") {
+                activateTFTAsLamp(TFT_LAMP_WHITE);
+                bot.sendMessage(chat_id, "🔆 TFT Lampu PUTIH dihidupkan", "");
+            }
+            else if (text == "/tft_red") {
+                activateTFTAsLamp(TFT_LAMP_RED);
+                bot.sendMessage(chat_id, "🔴 TFT Lampu MERAH dihidupkan", "");
+            }
+            else if (text == "/tft_green") {
+                activateTFTAsLamp(TFT_LAMP_GREEN);
+                bot.sendMessage(chat_id, "🟢 TFT Lampu HIJAU dihidupkan", "");
+            }
+            else if (text == "/tft_blue") {
+                activateTFTAsLamp(TFT_LAMP_BLUE);
+                bot.sendMessage(chat_id, "🔵 TFT Lampu BIRU dihidupkan", "");
+            }
+            else if (text == "/tft_off") { // Turn off TFT lamp
+                deactivateTFTAsLamp();
+                bot.sendMessage(chat_id, "⚫ TFT Lampu dimatikan", "");
+            }
+            // Existing commands
+            else if (text == "/start" || text == "/help" || text == "/menu") {
+                String menuMsg = generateMenuMessage();
+                bot.sendMessage(chat_id, menuMsg, "");
+            }
+            else if (text == "/status") {
+                String statusMsg = generateStatusMessage();
+                bot.sendMessage(chat_id, statusMsg, "");
+            }
+            else if (text == "/battery") {
+                sendBatteryStatus();
+            }
+            else if (text == "/pzem") {
+                sendPZEMStatus();
+            }
+            else if (text == "/relay_on") {
+                controlRelayViaTelegram(true);
+                bot.sendMessage(chat_id, "Relay turned ON for 2 seconds", "");
+            }
+            else if (text == "/relay_off") {
+                controlRelayViaTelegram(false);
+                bot.sendMessage(chat_id, "Relay turned OFF", "");
+            }
+            else if (text == "/notifikasi_baterai_on") {
+                batteryNotifications = true;
+                batteryDropWarning = false;
+                bot.sendMessage(chat_id, "Battery notifications ENABLED\nNow monitoring battery voltage", "");
+            }
+            else if (text == "/notifikasi_baterai_off") {
+                batteryNotifications = false;
+                batteryDropWarning = false;
+                lastBatteryDropMessage = 0;
+                bot.sendMessage(chat_id, "Battery notifications DISABLED", "");
+            }
+            else {
+                bot.sendMessage(chat_id, "Perintah tidak dikenal. Ketik /menu untuk daftar perintah", "");
+            }
+        }
+        numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    }
+}
+
+void sendTelegramMessage(String message) {
+    if (!telegramBotEnabled) return;
+
+    bool sent = bot.sendMessage(CHAT_ID, message, "");
+    if (sent) {
+        Serial.println("Telegram message sent");
+    } else {
+        Serial.println("Failed to send Telegram message");
+    }
+}
+
+void sendBatteryStatus() {
+    String message = "BATTERY STATUS\n";
+    message += "Cell 1: " + String(cell1, 2) + "V\n";
+    message += "Cell 2: " + String(cell2, 2) + "V\n";
+    message += "Cell 3: " + String(cell3, 2) + "V\n";
+    message += "Total: " + String(totalBatt, 2) + "V\n";
+    message += "Status: ";
+
+    if (totalBatt < 3.5) {
+        message += "CRITICAL! (Below 3.5V)\n";
+        message += "Action: Charge immediately!";
+    } else if (totalBatt < 11.0) {
+        message += "LOW\n";
+        message += "Action: Consider charging soon";
+    } else if (totalBatt < 12.0) {
+        message += "MEDIUM\n";
+        message += "Action: Battery OK";
+    } else if (totalBatt < 12.6) {
+        message += "NORMAL\n";
+        message += "Action: Battery good";
+    } else {
+        message += "FULL\n";
+        message += "Action: Battery fully charged";
+    }
+
+    sendTelegramMessage(message);
+}
+
+void sendPZEMStatus() {
+    String message = "PZEM MONITOR\n";
+    message += "Voltage: " + String(pzemVoltage, 1) + "V\n";
+    message += "Current: " + String(pzemCurrent, 2) + "A\n";
+    message += "Power: " + String(pzemPower, 1) + "W\n";
+    message += "Energy: " + String(pzemEnergy, 3) + "kWh\n";
+    message += "Frequency: " + String(pzemFreq, 1) + "Hz\n";
+    message += "Power Factor: " + String(pzemPF, 2);
+
+    sendTelegramMessage(message);
+}
+
+void controlRelayViaTelegram(bool state) {
+    if (state) {
+        relayState = true;
+        digitalWrite(RELAY_PIN, HIGH);
+        relayOnTime = millis();
+        relayStage = 3;
+    } else {
+        relayState = false;
+        digitalWrite(RELAY_PIN, LOW);
+        relayStage = 0;
+        relayOnTime = 0;
+    }
+    screenNeedsRedraw = true;
+}
+
+void handleBatteryNotifications() {
+    static float lastBatteryLevel = 0;
+    static unsigned long lastBatteryNotification = 0;
+    const unsigned long batteryNotificationInterval = 300000;
+
+    if (millis() - lastBatteryNotification < batteryNotificationInterval) {
+        return;
+    }
+
+    if (abs(totalBatt - lastBatteryLevel) >= 0.5) {
+        String notification = "BATTERY LEVEL UPDATE\n";
+        notification += "Previous: " + String(lastBatteryLevel, 2) + "V\n";
+        notification += "Current: " + String(totalBatt, 2) + "V\n";
+        notification += "Change: " + String(totalBatt - lastBatteryLevel, 2) + "V\n";
+        notification += "Time: " + String((char*)timeStr);
+
+        sendTelegramMessage(notification);
+        lastBatteryNotification = millis();
+        lastBatteryLevel = totalBatt;
+    }
+
+    if (totalBatt < 3.5 && lastBatteryLevel >= 3.5) {
+        String criticalMsg = "BATTERY CRITICAL!\n";
+        criticalMsg += "Voltage dropped below 3.5V\n";
+        criticalMsg += "Current: " + String(totalBatt, 2) + "V\n";
+        criticalMsg += "Time: " + String((char*)timeStr) + "\n";
+        criticalMsg += "Action: CHARGE IMMEDIATELY!";
+
+        sendTelegramMessage(criticalMsg);
+        lastBatteryNotification = millis();
+        lastBatteryLevel = totalBatt;
+    }
+    else if (totalBatt >= 12.6 && lastBatteryLevel < 12.6) {
+        String fullMsg = "BATTERY FULLY CHARGED\n";
+        fullMsg += "Voltage reached 12.6V\n";
+        fullMsg += "Current: " + String(totalBatt, 2) + "V\n";
+        fullMsg += "Time: " + String((char*)timeStr) + "\n";
+        fullMsg += "Status: Battery fully charged";
+
+        sendTelegramMessage(fullMsg);
+        lastBatteryNotification = millis();
+        lastBatteryLevel = totalBatt;
+    }
+}
+
+void handleBatteryDropWarning() {
+    if (!batteryNotifications) return;
+
+    bool cell1Low = cell1 < 3.5;
+    bool cell2Low = cell2 < 3.5;
+    bool cell3Low = cell3 < 3.5;
+
+    int lowCells = (cell1Low ? 1 : 0) + (cell2Low ? 1 : 0) + (cell3Low ? 1 : 0);
+
+    if (millis() - lastBatteryDropMessage > batteryDropInterval) {
+        String message = "";
+        bool shouldSend = false;
+
+        if (lowCells == 3) {
+            message = "⚠️ BATTERY DROP WARNING!\n";
+            message += "All battery cells are below 3.5V\n";
+            message += "Cell 1: " + String(cell1, 2) + "V\n";
+            message += "Cell 2: " + String(cell2, 2) + "V\n";
+            message += "Cell 3: " + String(cell3, 2) + "V\n";
+            message += "Total: " + String(totalBatt, 2) + "V\n";
+            message += "Time: " + String((char*)timeStr) + "\n";
+            message += "Status: CRITICAL - All cells low!\n";
+            message += "Action: Charge immediately!";
+            shouldSend = true;
+        }
+        else if (lowCells == 2) {
+            message = "⚠️ BATTERY NOT LINEAR!\n";
+            message += "2 cells are below 3.5V\n";
+            message += "Cell 1: " + String(cell1, 2) + "V " + (cell1Low ? "LOW" : "OK") + "\n";
+            message += "Cell 2: " + String(cell2, 2) + "V " + (cell2Low ? "LOW" : "OK") + "\n";
+            message += "Cell 3: " + String(cell3, 2) + "V " + (cell3Low ? "LOW" : "OK") + "\n";
+            message += "Total: " + String(totalBatt, 2) + "V\n";
+            message += "Time: " + String((char*)timeStr) + "\n";
+            message += "Status: Imbalanced battery!\n";
+            message += "Action: Check battery condition!";
+            shouldSend = true;
+        }
+        else if (lowCells == 1) {
+            message = "⚠️ BATTERY NOT LINEAR!\n";
+            message += "1 cell is below 3.5V\n";
+            message += "Cell 1: " + String(cell1, 2) + "V " + (cell1Low ? "LOW" : "OK") + "\n";
+            message += "Cell 2: " + String(cell2, 2) + "V " + (cell2Low ? "LOW" : "OK") + "\n";
+            message += "Cell 3: " + String(cell3, 2) + "V " + (cell3Low ? "LOW" : "OK") + "\n";
+            message += "Total: " + String(totalBatt, 2) + "V\n";
+            message += "Time: " + String((char*)timeStr) + "\n";
+            message += "Status: Cell imbalance detected!\n";
+            message += "Action: Check individual cells!";
+            shouldSend = true;
+        }
+        else if (lowCells == 0 && batteryDropWarning) {
+            message = "✅ BATTERY BACK TO NORMAL\n";
+            message += "All cells are above 3.5V\n";
+            message += "Cell 1: " + String(cell1, 2) + "V\n";
+            message += "Cell 2: " + String(cell2, 2) + "V\n";
+            message += "Cell 3: " + String(cell3, 2) + "V\n";
+            message += "Total: " + String(totalBatt, 2) + "V\n";
+            message += "Time: " + String((char*)timeStr) + "\n";
+            message += "Status: All cells OK";
+            shouldSend = true;
+            batteryDropWarning = false;
+        }
+
+        if (shouldSend) {
+            sendTelegramMessage(message);
+            lastBatteryDropMessage = millis();
+            if (lowCells > 0) {
+                batteryDropWarning = true;
+            }
+        }
+    }
+}
+
+String generateStatusMessage() {
+    String message = "SMART HOME SYSTEM STATUS\n";
+    message += "=========================\n";
+    message += "Time: " + String((char*)timeStr) + "\n";
+    message += "Date: " + String((char*)dateStr) + "\n";
+    message += "Day: " + String((char*)dayStr) + "\n";
+    message += "WiFi: " + String(WiFi.status() == WL_CONNECTED ? "Connected" : "Disconnected") + "\n";
+    message += "IP Address: " + WiFi.localIP().toString() + "\n";
+    message += "RSSI: " + String(WiFi.RSSI()) + " dBm\n";
+    message += "Relay State: " + String(relayState ? "ON" : "OFF") + "\n";
+
+    // TFT Lamp status
+    message += "\n💡 TFT LAMP STATUS: ";
+    if (tftLampMode) {
+      if (tftLampColor == TFT_LAMP_WHITE) message += "WHITE\n";
+      else if (tftLampColor == TFT_LAMP_RED) message += "RED\n";
+      else if (tftLampColor == TFT_LAMP_GREEN) message += "GREEN\n";
+      else if (tftLampColor == TFT_LAMP_BLUE) message += "BLUE\n";
+      else message += "ON (Custom Color)\n"; // Seharusnya tidak terjadi jika logika benar
+    } else {
+      message += "OFF\n";
+    }
+
+    message += "Battery Total: " + String(totalBatt, 2) + "V\n";
+    message += "Cell 1: " + String(cell1, 2) + "V\n";
+    message += "Cell 2: " + String(cell2, 2) + "V\n";
+    message += "Cell 3: " + String(cell3, 2) + "V\n";
+    message += "Battery Status: ";
+
+    if (totalBatt < 3.5) {
+        message += "CRITICAL (Below 3.5V)";
+    } else if (totalBatt < 11.0) {
+        message += "LOW";
+    } else if (totalBatt < 12.0) {
+        message += "MEDIUM";
+    } else {
+        message += "NORMAL";
+    }
+
+    message += "\nPZEM Power: " + String(pzemPower, 1) + "W\n";
+    message += "System Uptime: " + String(millis() / 1000 / 60) + " minutes\n";
+
+    message += "Battery Notifications: " + String(batteryNotifications ? "ON" : "OFF") + "\n";
+    message += "Battery Drop Monitoring: " + String(batteryDropWarning ? "ACTIVE" : "INACTIVE") + "\n";
+
+    return message;
+}
+
+String generateMenuMessage() {
+    String menu = "🏠 SMART HOME + LAMP BOT\n";
+    menu += "===============================\n";
+    menu += "\n💡 TFT LAMP COMMANDS:\n";
+    menu += "/tft_white - Layar PUTIH\n";
+    menu += "/tft_red - Layar MERAH\n";
+    menu += "/tft_green - Layar HIJAU\n";
+    menu += "/tft_blue - Layar BIRU\n";
+    menu += "/tft_off - Matikan Layar Lampu\n";
+
+    menu += "\n🔌 SYSTEM:\n";
+    menu += "/status - Status lengkap\n";
+    menu += "/menu - Menu ini\n";
+
+    menu += "\n🔋 BATTERY:\n";
+    menu += "/battery - Cek baterai\n";
+    menu += "/notifikasi_baterai_on - Notif ON\n";
+    menu += "/notifikasi_baterai_off - Notif OFF\n";
+
+    menu += "\n⚡ POWER:\n";
+    menu += "/pzem - Data PZEM\n";
+
+    menu += "\n🔄 RELAY:\n";
+    menu += "/relay_on - Relay ON (2s)\n";
+    menu += "/relay_off - Relay OFF\n";
+
+    menu += "\n📱 Gunakan perintah di atas!";
+    return menu;
+}
+
+String getBatteryNotificationStatus() {
+    return batteryNotifications ? "ON" : "OFF";
+}
+
+// ===================== WIFI FUNCTIONS =====================
+void setupWiFiDualMode() {
+    Serial.println("\n=== Setting up WiFi Dual Mode ===");
+
+    Serial.print("Connecting to STA: ");
+    Serial.println(sta_ssid);
+
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.begin(sta_ssid, sta_password);
+
+    int sta_timeout = 0;
+    while (WiFi.status() != WL_CONNECTED && sta_timeout < 15) {
+        delay(500);
+        Serial.print(".");
+        sta_timeout++;
+    }
+
+    Serial.print("\nSetting up AP: ");
+    Serial.println(ap_ssid);
+
+    WiFi.softAP(ap_ssid, ap_password);
+    delay(1000);
+
+    if (WiFi.status() == WL_CONNECTED) {
+        sta_ip = WiFi.localIP().toString();
+        Serial.print("STA IP: ");
+        Serial.println(sta_ip);
+    }
+
+    ap_ip = WiFi.softAPIP().toString();
+    Serial.print("AP IP: ");
+    Serial.println(ap_ip);
+
+    if (!MDNS.begin("smarthome")) {
+        Serial.println("Error setting up mDNS!");
+    } else {
+        Serial.println("mDNS: http://smarthome.local");
+        MDNS.addService("http", "tcp", 80);
+    }
+
+    currentWiFiState = (WiFi.status() == WL_CONNECTED);
+    lastWiFiState = currentWiFiState;
+}
+
+void checkAndUpdateWiFiIndicator() {
+    currentWiFiState = (WiFi.status() == WL_CONNECTED);
+
+    if (currentWiFiState != lastWiFiState) {
+        // Hanya update jika tidak dalam mode lampu TFT
+        if (!tftLampMode && currentScreen == 0) {
+            drawWiFiIndicator();
+        }
+        lastWiFiState = currentWiFiState;
+        lastWiFiCheck = millis();
+    }
+}
+
+void drawWiFiIndicator() {
+    int x = tft.width() - 28;
+    int y = 25;
+
+    tft.fillRect(x - 4, y - 4, 20, 20, PANEL_DARK);
+
+    bool wifiConnected = (WiFi.status() == WL_CONNECTED);
+
+    if (wifiConnected) {
+        tft.fillRect(x - 3, y + 6, 2, 4, ACCENT_GREEN);
+        tft.fillRect(x, y + 4, 2, 6, ACCENT_GREEN);
+        tft.fillRect(x + 3, y + 2, 2, 8, ACCENT_GREEN);
+        tft.fillCircle(x, y + 10, 1, ACCENT_GREEN);
+    } else {
+        tft.fillRect(x - 3, y + 6, 2, 4, ACCENT_RED);
+        tft.fillRect(x, y + 4, 2, 6, ACCENT_RED);
+        tft.fillRect(x + 3, y + 2, 2, 8, ACCENT_RED);
+        tft.fillCircle(x, y + 10, 1, ACCENT_RED);
+
+        tft.drawLine(x - 2, y - 1, x + 2, y + 3, ACCENT_RED);
+        tft.drawLine(x + 2, y - 1, x - 2, y + 3, ACCENT_RED);
+    }
+}
+
+// ===================== WEB SERVER FUNCTIONS =====================
+void setupWebServer() {
+    server.on("/", HTTP_GET, handleRoot);
+    server.on("/data", HTTP_GET, handleData);
+    server.onNotFound([]() {
+        server.send(404, "text/plain", "Not Found");
+    });
+
+    server.begin();
+    Serial.println("HTTP server started");
+}
+
+void handleRoot() {
+    String page = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta charset="UTF-8">
+    <title>Smart Home Monitor</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background: #f5f5f5;
+            color: #333;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 { color: #2c3e50; text-align: center; }
+        h2 { color: #3498db; border-bottom: 2px solid #eee; padding-bottom: 5px; }
+        .card {
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 5px;
+            padding: 15px;
+            margin: 15px 0;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 10px 0;
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: center;
+        }
+        th { background: #3498db; color: white; }
+        .wifi-info {
+            background: #fff3cd;
+            padding: 10px;
+            border-radius: 5px;
+            margin: 10px 0;
+            font-size: 0.9em;
+        }
+    </style>
+    <script>
+        function updateReadings() {
+            var xhr = new XMLHttpRequest();
+            xhr.open('GET', '/data', true);
+            xhr.onload = function() {
+                if(xhr.status == 200) {
+                    var data = JSON.parse(xhr.responseText);
+
+                    document.getElementById('cell1_v').innerText = data.cell1.toFixed(3);
+                    document.getElementById('cell2_v').innerText = data.cell2.toFixed(3);
+                    document.getElementById('cell3_v').innerText = data.cell3.toFixed(3);
+                    document.getElementById('total_v').innerText = data.total.toFixed(3);
+
+                    document.getElementById('pzem_voltage').innerText = data.pzem_voltage.toFixed(1);
+                    document.getElementById('pzem_current').innerText = data.pzem_current.toFixed(2);
+                    document.getElementById('pzem_power').innerText = data.pzem_power.toFixed(1);
+                    document.getElementById('pzem_energy').innerText = data.pzem_energy.toFixed(3);
+                    document.getElementById('pzem_freq').innerText = data.pzem_freq.toFixed(1);
+                    document.getElementById('pzem_pf').innerText = data.pzem_pf.toFixed(2);
+                }
+            };
+            xhr.send();
+        }
+
+        setInterval(updateReadings, 2000);
+
+        window.onload = function() {
+            updateReadings();
+        };
+    </script>
+</head>
+<body>
+    <div class="container">
+        <h1>SMART HOME MONITORING</h1>
+
+        <div class="wifi-info">
+            <strong>WiFi:</strong> <span id="wifi_ssid">Loading...</span><br>
+            <strong>IP:</strong> <span id="wifi_ip">Loading...</span>
+        </div>
+
+        <div class="card">
+            <h2>BATTERY BMS READINGS</h2>
+            <table>
+                <tr>
+                    <th>Cell</th><th>Voltage (V)</th>
+                </tr>
+                <tr>
+                    <td>Cell 1</td>
+                    <td id="cell1_v">--</td>
+                </tr>
+                <tr>
+                    <td>Cell 2</td>
+                    <td id="cell2_v">--</td>
+                </tr>
+                <tr>
+                    <td>Cell 3</td>
+                    <td id="cell3_v">--</td>
+                </tr>
+                <tr>
+                    <td><strong>Total</strong></td>
+                    <td id="total_v">--</td>
+                </tr>
+            </table>
+        </div>
+
+        <div class="card">
+            <h2>PZEM-004T READINGS</h2>
+            <table>
+                <tr>
+                    <th>Parameter</th><th>Value</th>
+                </tr>
+                <tr>
+                    <td>Voltage</td>
+                    <td id="pzem_voltage">--</td>
+                </tr>
+                <tr>
+                    <td>Current</td>
+                    <td id="pzem_current">--</td>
+                </tr>
+                <tr>
+                    <td>Power</td>
+                    <td id="pzem_power">--</td>
+                </tr>
+                <tr>
+                    <td>Energy</td>
+                    <td id="pzem_energy">--</td>
+                </tr>
+                <tr>
+                    <td>Frequency</td>
+                    <td id="pzem_freq">--</td>
+                </tr>
+                <tr>
+                    <td>Power Factor</td>
+                    <td id="pzem_pf">--</td>
+                </tr>
+            </table>
+        </div>
+
+        <div style="text-align: center; margin-top: 20px; color: #777; font-size: 0.8em;">
+            Smart Home System | Update: Auto-refresh every 2s
+        </div>
+    </div>
+    <script>
+        document.getElementById('wifi_ssid').innerText = "%AP_SSID%";
+        document.getElementById('wifi_ip').innerText = "%AP_IP%";
+    </script>
+</body>
+</html>
+)rawliteral";
+    page.replace("%AP_SSID%", ap_ssid);
+    page.replace("%AP_IP%", WiFi.softAPIP().toString());
+    server.send(200, "text/html", page);
+}
+
+void handleData() {
+    String json = "{";
+    json += "\"cell1\":" + String(cell1, 4) + ",";
+    json += "\"cell2\":" + String(cell2, 4) + ",";
+    json += "\"cell3\":" + String(cell3, 4) + ",";
+    json += "\"total\":" + String(totalBatt, 4) + ",";
+
+    json += "\"pzem_voltage\":" + String(pzemVoltage, 2) + ",";
+    json += "\"pzem_current\":" + String(pzemCurrent, 3) + ",";
+    json += "\"pzem_power\":" + String(pzemPower, 2) + ",";
+    json += "\"pzem_energy\":" + String(pzemEnergy, 4) + ",";
+    json += "\"pzem_freq\":" + String(pzemFreq, 2) + ",";
+    json += "\"pzem_pf\":" + String(pzemPF, 3);
+    json += "}";
+
+    server.send(200, "application/json", json);
+}
+
+// ===================== TOUCH FUNCTIONS =====================
+void handleTouch() {
+    static unsigned long lastTouch = 0;
+    if (ts.touched() && (millis() - lastTouch > 400)) {
+        TS_Point p = ts.getPoint();
+        p.x = map(p.x, 200, 3800, tft.width(), 0);
+        p.y = map(p.y, 200, 3800, tft.height(), 0);
+
+        if (p.z > 100) {
+            lastTouchTime = millis();
+            lastTouch = millis();
+
+            if (currentScreen == 3) {
+                processRelayTouch(p.x, p.y);
+            } else {
+                currentScreen = (currentScreen + 1) % 4;
+                if (currentScreen != 3 && (relayStage != 0 || relayState)) {
+                    relayStage = 0;
+                    if (relayState == true) {
+                        relayState = false;
+                        digitalWrite(RELAY_PIN, LOW);
+                    }
+                    relayOnTime = 0;
+                }
+                screenNeedsRedraw = true;
+            }
+        }
+    }
+}
+
+bool checkTouchArea(int tx, int ty, int x, int y, int w, int h) {
+    return tx >= x && tx <= (x + w) && ty >= y && ty <= (y + h);
+}
+
+void processRelayTouch(int tx, int ty) {
+    int btnR_Off = 50;
+    int btnR_On = 50;
+    int btnX = tft.width() / 2;
+    int btnY = tft.height() / 2 + 30;
+
+    int keyWidth = 65, keyHeight = 45, keySpacing = 5;
+    int totalWidth = (4 * keyWidth) + (3 * keySpacing);
+    int startX = (tft.width() - totalWidth) / 2;
+    int startY = 110;
+
+    int btn2X = startX + keyWidth + keySpacing;
+    int btn3X = btn2X + keyWidth + keySpacing;
+    int btn4X = btn3X + keyWidth + keySpacing;
+    int row1Y = startY;
+    int row2Y = row1Y + keyHeight + keySpacing;
+    int row3Y = row2Y + keyHeight + keySpacing;
+
+    if (relayStage == 0 && !relayState) {
+        if (sqrt(pow(tx - btnX, 2) + pow(ty - btnY, 2)) < btnR_Off) {
+            relayStage = 1;
+            screenNeedsRedraw = true;
+        }
+    } else if (relayStage == 0 && relayState) {
+        if (sqrt(pow(tx - btnX, 2) + pow(ty - btnY, 2)) < btnR_On) {
+            relayState = false;
+            digitalWrite(RELAY_PIN, LOW);
+            relayStage = 0;
+            screenNeedsRedraw = true;
+        }
+    } else if (relayStage == 1) {
+        if (checkTouchArea(tx, ty, 0, 0, tft.width(), tft.height())) {
+            relayStage = 2;
+            inputPIN = "";
+            screenNeedsRedraw = true;
+        }
+    } else if (relayStage == 2) {
+        if (checkTouchArea(tx, ty, startX, row1Y, keyWidth, keyHeight)) {
+            if (inputPIN.length() < maxInputLength) { inputPIN += "1"; updateRelayScreen(); return; }
+        }
+        if (checkTouchArea(tx, ty, btn2X, row1Y, keyWidth, keyHeight)) {
+            if (inputPIN.length() < maxInputLength) { inputPIN += "2"; updateRelayScreen(); return; }
+        }
+        if (checkTouchArea(tx, ty, btn3X, row1Y, keyWidth, keyHeight)) {
+            if (inputPIN.length() < maxInputLength) { inputPIN += "3"; updateRelayScreen(); return; }
+        }
+        if (checkTouchArea(tx, ty, btn4X, row1Y, keyWidth, keyHeight)) {
+            relayStage = 0;
+            inputPIN = "";
+            screenNeedsRedraw = true;
+            return;
+        }
+
+        if (checkTouchArea(tx, ty, startX, row2Y, keyWidth, keyHeight)) {
+            if (inputPIN.length() < maxInputLength) { inputPIN += "4"; updateRelayScreen(); return; }
+        }
+        if (checkTouchArea(tx, ty, btn2X, row2Y, keyWidth, keyHeight)) {
+            if (inputPIN.length() < maxInputLength) { inputPIN += "5"; updateRelayScreen(); return; }
+        }
+        if (checkTouchArea(tx, ty, btn3X, row2Y, keyWidth, keyHeight)) {
+            if (inputPIN.length() < maxInputLength) { inputPIN += "6"; updateRelayScreen(); return; }
+        }
+        if (checkTouchArea(tx, ty, btn4X, row2Y, keyWidth, keyHeight)) {
+            if (inputPIN.length() < maxInputLength) { inputPIN += "0"; updateRelayScreen(); return; }
+        }
+
+        if (checkTouchArea(tx, ty, startX, row3Y, keyWidth, keyHeight)) {
+            if (inputPIN.length() < maxInputLength) { inputPIN += "7"; updateRelayScreen(); return; }
+        }
+        if (checkTouchArea(tx, ty, btn2X, row3Y, keyWidth, keyHeight)) {
+            if (inputPIN.length() < maxInputLength) { inputPIN += "8"; updateRelayScreen(); return; }
+        }
+        if (checkTouchArea(tx, ty, btn3X, row3Y, keyWidth, keyHeight)) {
+            if (inputPIN.length() < maxInputLength) { inputPIN += "9"; updateRelayScreen(); return; }
+        }
+
+        if (checkTouchArea(tx, ty, btn4X, row3Y, keyWidth, keyHeight)) {
+            int minRequiredLength = strlen(SECURITY_PIN);
+
+            if (inputPIN.length() >= minRequiredLength && inputPIN.length() <= maxInputLength) {
+                if (inputPIN == SECURITY_PIN) {
+                    relayState = true;
+                    digitalWrite(RELAY_PIN, HIGH);
+                    relayStage = 3;
+                    screenNeedsRedraw = true;
+                    relayOnTime = millis();
+                } else {
+                    int pinWrongX = startX;
+                    int pinWrongW = totalWidth;
+                    int pinWrongY = startY - 30;
+                    tft.fillRect(pinWrongX, pinWrongY, pinWrongW, 20, BG_COLOR);
+                    tft.setTextColor(ACCENT_RED);
+                    tft.setTextSize(2);
+                    tft.setCursor(centerTextX("PIN SALAH", pinWrongX, pinWrongW, 2), pinWrongY);
+                    tft.print("PIN SALAH");
+
+                    inputPIN = "";
+                    delay(1000);
+                    screenNeedsRedraw = true;
+                }
+            } else {
+                int pinWrongX = startX;
+                int pinWrongW = totalWidth;
+                int pinWrongY = startY - 30;
+
+                tft.fillRect(pinWrongX, pinWrongY, pinWrongW, 20, BG_COLOR);
+                tft.setTextColor(ACCENT_ORANGE);
+                tft.setTextSize(1);
+                tft.setCursor(centerTextX("PIN: " + String(minRequiredLength) + "-" + String(maxInputLength) + " DIGIT", pinWrongX, pinWrongW, 1), pinWrongY);
+                tft.print("PIN: " + String(minRequiredLength) + "-" + String(maxInputLength) + " DIGIT");
+                delay(1000);
+                screenNeedsRedraw = true;
+            }
+            inputPIN = "";
+            return;
+        }
+    } else if (relayStage == 3) {
+        if (sqrt(pow(tx - btnX, 2) + pow(ty - btnY, 2)) < btnR_On) {
+            relayState = false;
+            digitalWrite(RELAY_PIN, LOW);
+            relayStage = 0;
+            relayOnTime = 0;
+            screenNeedsRedraw = true;
+        }
+    }
+}
+
+// ===================== UI FUNCTIONS =====================
+void drawCurrentScreen() {
+    tft.fillScreen(BG_COLOR);
+
+    // Reset old values
+    oldTime = ""; oldDate = ""; oldDay = "";
+    oldVoltage = -1; oldCurrent = -1; oldPower = -1; oldEnergy = -1;
+    oldCell1 = -1; oldCell2 = -1; oldCell3 = -1; oldTotalBatt = -1;
+    oldRelayState = relayState;
+
+    // Jika mode lampu TFT aktif, layar sudah penuh warna, hanya tambahkan tulisan "night mode"
+    if (tftLampMode) {
+        tft.fillScreen(tftLampColor);
+        drawNightModeIndicator();
+    } else { // Mode UI normal
+        switch(currentScreen) {
+            case 0: drawHomeScreen(); break;
+            case 1: drawBMSScreen(); break;
+            case 2: drawPowerScreen(); break;
+            case 3: drawRelayScreen(); break;
+        }
+        drawScreenIndicators();
+    }
+}
+
+void updateChangingData() {
+    // Jika mode lampu TFT aktif, tidak perlu update data UI lainnya
+    if (tftLampMode) return;
+
+    switch(currentScreen) {
+        case 0: updateHomeScreen(); break;
+        case 1: updateBMSScreen(); break;
+        case 2: updatePowerScreen(); break;
+        case 3: updateRelayScreen(); break;
+    }
+}
+
+// Utility functions
+int getTextWidth(const String &text, int textSize) {
+    return text.length() * (textSize * 6);
+}
+
+int centerTextX(const String &text, int x, int width, int textSize) {
+    return x + (width - getTextWidth(text, textSize)) / 2;
+}
+
+// Screen 0: Home
+void drawHomeScreen() {
+    char dayStrLocal[10], dateStrLocal[9];
+    memcpy(dayStrLocal, (char*)dayStr, sizeof(dayStrLocal));
+    memcpy(dateStrLocal, (char*)dateStr, sizeof(dateStrLocal));
+
+    if (timeValid && currentMonth == HBD_MONTH && currentDay == HBD_DAY) {
+        drawHBD(HBD_NAME);
+        return;
+    }
+
+    int headerX = 10, headerY = 10, headerW = tft.width() - 20, headerH = 55;
+    tft.fillRoundRect(headerX, headerY, headerW, headerH, 12, PANEL_DARK);
+    tft.drawRoundRect(headerX, headerY, headerW, headerH, 12, ACCENT_BLUE);
+
+    tft.setTextColor(TEXT_WHITE);
+    tft.setTextSize(3);
+    tft.setCursor(centerTextX("SMART HOME", headerX, headerW, 3), headerY + 15);
+    tft.print("SMART HOME");
+
+    int timePanelX = 15, timePanelY = 75, timePanelW = tft.width() - 30, timePanelH = 100;
+    tft.fillRoundRect(timePanelX, timePanelY, timePanelW, timePanelH, 14, PANEL_DARK);
+    tft.drawRoundRect(timePanelX, timePanelY, timePanelW, timePanelH, 14, BORDER_LIGHT);
+
+    int datePanelX = 15, datePanelY = 190, datePanelW = tft.width() - 30, datePanelH = 60;
+    tft.fillRoundRect(datePanelX, datePanelY, datePanelW, datePanelH, 12, PANEL_DARK);
+    tft.drawRoundRect(datePanelX, datePanelY, datePanelW, datePanelH, 12, BORDER_LIGHT);
+
+    updateHomeScreen();
+
+    tft.setTextColor(TEXT_GRAY);
+    tft.setTextSize(1);
+    tft.setCursor(centerTextX("Touch to change screen", 0, tft.width(), 1), 270);
+    tft.print("Touch to change screen");
+
+    drawWiFiIndicator();
+}
+
+void updateHomeScreen() {
+    if (tftLampMode) return; // Jangan update jika mode lampu aktif
+
+    char timeStrLocal[9], dateStrLocal[9], dayStrLocal[10];
+    memcpy(timeStrLocal, (char*)timeStr, sizeof(timeStrLocal));
+    memcpy(dateStrLocal, (char*)dateStr, sizeof(dateStrLocal));
+    memcpy(dayStrLocal, (char*)dayStr, sizeof(dayStrLocal));
+
+    if (timeValid && currentMonth == HBD_MONTH && currentDay == HBD_DAY) {
+        return;
+    }
+
+    String timeDisplay = String(timeStrLocal).substring(0, 5);
+
+    if (timeDisplay != oldTime) {
+        tft.fillRect(25, 85, tft.width() - 50, 80, PANEL_DARK);
+        tft.setTextColor(ACCENT_BLUE);
+        tft.setTextSize(6);
+        tft.setCursor(centerTextX(timeDisplay, 15, tft.width() - 30, 6), 90);
+        tft.print(timeDisplay);
+        oldTime = timeDisplay;
+    }
+
+    String dateStrLocalStr = String(dateStrLocal);
+    String dayStrLocalStr = String(dayStrLocal);
+
+    if (dateStrLocalStr != oldDate || dayStrLocalStr != oldDay) {
+        tft.fillRect(25, 200, tft.width() - 50, 45, PANEL_DARK);
+        tft.setTextColor(TEXT_WHITE);
+        tft.setTextSize(2);
+        tft.setCursor(centerTextX(dayStrLocalStr, 15, tft.width() - 30, 2), 200);
+        tft.print(dayStrLocalStr);
+        tft.setTextColor(ACCENT_GREEN);
+        tft.setCursor(centerTextX(dateStrLocalStr, 15, tft.width() - 30, 2), 225);
+        tft.print(dateStrLocalStr);
+        oldDate = dateStrLocalStr;
+        oldDay = dayStrLocalStr;
+    }
+
+    currentWiFiState = (WiFi.status() == WL_CONNECTED);
+    if (currentWiFiState != lastWiFiState) {
+        drawWiFiIndicator();
+        lastWiFiState = currentWiFiState;
+    }
+}
+
+void drawHBD(const char* name) {
+    if (tftLampMode) return; // Jangan update jika mode lampu aktif
+    tft.fillScreen(0x0000);
+
+    int centerX = tft.width() / 2;
+    int textY = 100;
+
+    for(int i = 0; i < 30; i++) {
+        tft.drawPixel(random(tft.width()), random(tft.height()), 0xFFFF);
+    }
+
+    int cakeX = centerX;
+    int cakeY = 50;
+    int cakeWidth = 80;
+    int cakeHeight = 35;
+    uint16_t cakeColor = 0xF5A0;
+
+    tft.fillRoundRect(cakeX - cakeWidth/2, cakeY + cakeHeight, cakeWidth, cakeHeight, 5, cakeColor);
+    tft.drawRoundRect(cakeX - cakeWidth/2, cakeY + cakeHeight, cakeWidth, cakeHeight, 5, 0xFBE0);
+    tft.fillRoundRect(cakeX - cakeWidth/3, cakeY, cakeWidth*2/3, cakeHeight, 5, cakeColor);
+    tft.drawRoundRect(cakeX - cakeWidth/3, cakeY, cakeWidth*2/3, cakeHeight, 5, 0xFBE0);
+
+    int candleW = 5, candleH = 15;
+    for(int i = -2; i <= 2; i++) {
+        tft.fillRect(cakeX + i*10, cakeY - candleH, candleW, candleH, 0xF800);
+        tft.fillCircle(cakeX + i*10 + 2, cakeY - candleH - 3, 3, 0xFFE0);
+    }
+
+    String hbdText = "HAPPY BIRTHDAY!";
+    tft.setTextSize(3);
+    tft.setTextColor(0xF81F);
+    tft.setCursor(centerTextX(hbdText, 0, tft.width(), 3), textY + 50);
+    tft.print(hbdText);
+
+    String nameText = String(name);
+    tft.setTextSize(5);
+    for (int i = 0; i < nameText.length(); i++) {
+        uint16_t color = tft.color565(random(128,255), random(128,255), random(128,255));
+        tft.setTextColor(color);
+        int startX = centerTextX(nameText, 0, tft.width(), 5);
+        tft.setCursor(startX + getTextWidth(nameText.substring(0, i), 5), textY + 95);
+        tft.print(nameText[i]);
+    }
+
+    String wishText = "Semoga panjang umur dan sehat selalu!";
+    tft.setTextSize(2);
+    tft.setTextColor(TEXT_WHITE);
+    tft.setCursor(centerTextX(wishText, 0, tft.width(), 2), textY + 155);
+    tft.print(wishText);
+
+    drawScreenIndicators();
+    tft.setTextColor(TEXT_GRAY);
+    tft.setTextSize(1);
+    tft.setCursor(centerTextX("Touch to change screen", 0, tft.width(), 1), 270);
+    tft.print("Touch to change screen");
+
+    drawWiFiIndicator();
+}
+
+// Screen 1: BMS
+void drawBMSScreen() {
+    int headerX = 10, headerY = 10, headerW = tft.width() - 20, headerH = 55;
+    tft.fillRoundRect(headerX, headerY, headerW, headerH, 12, PANEL_DARK);
+    tft.drawRoundRect(headerX, headerY, headerW, headerH, 12, ACCENT_PURPLE);
+
+    tft.setTextColor(TEXT_WHITE);
+    tft.setTextSize(3);
+    tft.setCursor(centerTextX("BATTERY BMS", headerX, headerW, 3), headerY + 15);
+    tft.print("BATTERY BMS");
+
+    int infoX = 15, infoY = 75, infoW = tft.width() - 30, infoH = 50;
+    tft.fillRoundRect(infoX, infoY, infoW, infoH, 8, PANEL_DARK);
+    tft.drawRoundRect(infoX, infoY, infoW, infoH, 8, BORDER_LIGHT);
+
+    tft.setTextSize(1);
+    tft.setTextColor(TEXT_WHITE);
+    tft.setCursor(infoX + 10, infoY + 10);
+    tft.print("Type: LiPo 3S 2P");
+    tft.setCursor(infoX + 10, infoY + 25);
+    tft.print("Capacity: 8.2 Ah");
+    tft.setCursor(infoX + 10, infoY + 40);
+    tft.print("Total:");
+
+    int cellSpacing = 8;
+    int actualCellW = (tft.width() - (2 * 15) - (2 * cellSpacing)) / 3;
+    int startX = 15, cellY = 140, cellH = 95;
+
+    for (int i = 0; i < 3; i++) {
+        int x = startX + i * (actualCellW + cellSpacing);
+        tft.fillRoundRect(x, cellY, actualCellW, cellH, 8, PANEL_DARK);
+        tft.drawRoundRect(x, cellY, actualCellW, cellH, 8, BORDER_LIGHT);
+
+        tft.setTextColor(TEXT_WHITE);
+        tft.setTextSize(2);
+        String cellLabel = "CELL " + String(i+1);
+        tft.setCursor(centerTextX(cellLabel, x, actualCellW, 2), cellY + 10);
+        tft.print(cellLabel);
+
+        tft.drawFastHLine(x + 5, cellY + 30, actualCellW - 10, BORDER_LIGHT);
+    }
+
+    updateBMSScreen();
+}
+
+void updateBMSScreen() {
+    if (tftLampMode) return; // Jangan update jika mode lampu aktif
+
+    int infoX = 15, infoY = 75, infoW = tft.width() - 30;
+    if (abs(totalBatt - oldTotalBatt) > 0.05) {
+        tft.fillRect(infoX + 45, infoY + 40, 50, 8, PANEL_DARK);
+        tft.setTextSize(1);
+        tft.setTextColor(ACCENT_BLUE);
+        tft.setCursor(infoX + 45, infoY + 40);
+        tft.print(totalBatt, 2);
+        tft.print("V");
+        oldTotalBatt = totalBatt;
+    }
+
+    int cellSpacing = 8;
+    int actualCellW = (tft.width() - (2 * 15) - (2 * cellSpacing)) / 3;
+    int startX = 15, cellY = 140, cellH = 95;
+
+    float cells[3] = {cell1, cell2, cell3};
+    float* oldCells[3] = {&oldCell1, &oldCell2, &oldCell3};
+
+    for (int i = 0; i < 3; i++) {
+        if (abs(*oldCells[i] - cells[i]) > 0.02) {
+            int x = startX + i * (actualCellW + cellSpacing);
+            tft.fillRect(x + 5, cellY + 50, actualCellW - 10, 20, PANEL_DARK);
+
+            String voltStr = String(cells[i], 2) + "V";
+            uint16_t voltColor;
+            if (cells[i] > 4.15) voltColor = ACCENT_GREEN;
+            else if (cells[i] > 3.7) voltColor = ACCENT_YELLOW;
+            else if (cells[i] > 3.3) voltColor = ACCENT_ORANGE;
+            else voltColor = ACCENT_RED;
+
+            tft.setTextSize(2);
+            tft.setTextColor(voltColor);
+            tft.setCursor(centerTextX(voltStr, x, actualCellW, 2), cellY + 50);
+            tft.print(voltStr);
+
+            int barW = actualCellW - 20;
+            int barH = 6;
+            int barX = x + 10;
+            int barY = cellY + 75;
+
+            tft.fillRect(barX + 2, barY + 2, barW - 4, barH - 4, BG_COLOR);
+            int fillW = map((int)(cells[i] * 100), 330, 420, 0, barW - 4);
+            fillW = constrain(fillW, 0, barW - 4);
+            tft.fillRect(barX + 2, barY + 2, fillW, barH - 4, voltColor);
+
+            *oldCells[i] = cells[i];
+        }
+    }
+}
+
+// Screen 2: Power Monitor
+void drawPowerScreen() {
+    int headerX = 10, headerY = 10, headerW = tft.width() - 20, headerH = 55;
+    tft.fillRoundRect(headerX, headerY, headerW, headerH, 12, PANEL_DARK);
+    tft.drawRoundRect(headerX, headerY, headerW, headerH, 12, ACCENT_BLUE);
+
+    tft.setTextColor(TEXT_WHITE);
+    tft.setTextSize(3);
+    tft.setCursor(centerTextX("POWER MONITOR", headerX, headerW, 3), headerY + 15);
+    tft.print("POWER MONITOR");
+
+    int panelW = (tft.width() - (3 * 15)) / 2;
+    int panelH = 75;
+
+    tft.fillRoundRect(15, 80, panelW, panelH, 8, PANEL_DARK);
+    tft.drawRoundRect(15, 80, panelW, panelH, 8, BORDER_LIGHT);
+
+    tft.fillRoundRect(30 + panelW, 80, panelW, panelH, 8, PANEL_DARK);
+    tft.drawRoundRect(30 + panelW, 80, panelW, panelH, 8, BORDER_LIGHT);
+
+    tft.fillRoundRect(15, 165, panelW, panelH, 8, PANEL_DARK);
+    tft.drawRoundRect(15, 165, panelW, panelH, 8, BORDER_LIGHT);
+
+    tft.fillRoundRect(30 + panelW, 165, panelW, panelH, 8, PANEL_DARK);
+    tft.drawRoundRect(30 + panelW, 165, panelW, panelH, 8, BORDER_LIGHT);
+
+    int bottomPanelW = (tft.width() - (3 * 15)) / 2;
+    tft.fillRoundRect(15, 250, bottomPanelW, 35, 6, PANEL_DARK);
+    tft.drawRoundRect(15, 250, bottomPanelW, 35, 6, BORDER_LIGHT);
+
+    tft.fillRoundRect(30 + bottomPanelW, 250, bottomPanelW, 35, 6, PANEL_DARK);
+    tft.drawRoundRect(30 + bottomPanelW, 250, bottomPanelW, 35, 6, BORDER_LIGHT);
+
+    tft.setTextSize(1);
+    tft.setTextColor(TEXT_WHITE);
+
+    String labels[] = {"VOLT", "CURRENT", "POWER", "ENERGY", "FREQ", "PF"};
+    int labelX[] = {15, 30 + panelW, 15, 30 + panelW, 15, 30 + bottomPanelW};
+    int labelY[] = {80, 80, 165, 165, 250, 250};
+
+    for (int i = 0; i < 6; i++) {
+        tft.setCursor(centerTextX(labels[i], labelX[i], (i < 4 ? panelW : bottomPanelW), 1), labelY[i] + 10);
+        tft.print(labels[i]);
+    }
+
+    updatePowerScreen();
+}
+
+void updatePowerScreen() {
+    if (tftLampMode) return; // Jangan update jika mode lampu aktif
+
+    int panelW = (tft.width() - (3 * 15)) / 2;
+    int bottomPanelW = (tft.width() - (3 * 15)) / 2;
+
+    if (abs(oldVoltage - pzemVoltage) > 0.1) {
+        updatePowerValue(15, 80, panelW, 75, String(pzemVoltage, 1) + "V", ACCENT_BLUE);
+        oldVoltage = pzemVoltage;
+    }
+
+    if (abs(oldCurrent - pzemCurrent) > 0.01) {
+        updatePowerValue(30 + panelW, 80, panelW, 75, String(pzemCurrent, 2) + "A", ACCENT_GREEN);
+        oldCurrent = pzemCurrent;
+    }
+
+    if (abs(oldPower - pzemPower) > 0.5) {
+        updatePowerValue(15, 165, panelW, 75, String(pzemPower, 1) + "W", ACCENT_YELLOW);
+        oldPower = pzemPower;
+    }
+
+    if (oldEnergy != pzemEnergy) {
+        String energyStr;
+        if (pzemEnergy >= 10.0) energyStr = String(pzemEnergy, 1) + "kWh";
+        else if (pzemEnergy >= 1.0) energyStr = String(pzemEnergy, 2) + "kWh";
+        else energyStr = String(pzemEnergy, 3) + "kWh";
+
+        updatePowerValue(30 + panelW, 165, panelW, 75, energyStr, ACCENT_ORANGE);
+        oldEnergy = pzemEnergy;
+    }
+
+    updatePowerValueSmall(15, 250, bottomPanelW, 35, String(pzemFreq, 1) + "Hz", ACCENT_CYAN);
+    updatePowerValueSmall(30 + bottomPanelW, 250, bottomPanelW, 35, String(pzemPF, 2), ACCENT_PURPLE);
+}
+
+void updatePowerValue(int x, int y, int w, int h, const String &value, uint16_t color) {
+    tft.fillRect(x + 5, y + 45, w - 10, 20, PANEL_DARK);
+    tft.setTextColor(color);
+    tft.setTextSize(2);
+    tft.setCursor(centerTextX(value, x, w, 2), y + 45);
+    tft.print(value);
+}
+
+void updatePowerValueSmall(int x, int y, int w, int h, const String &value, uint16_t color) {
+    tft.fillRect(x + 5, y + 20, w - 10, 10, PANEL_DARK);
+    tft.setTextColor(color);
+    tft.setTextSize(1);
+    tft.setCursor(centerTextX(value, x, w, 1), y + 20);
+    tft.print(value);
+}
+
+// Screen 3: Relay Control
+void drawRelayScreen() {
+    int headerX = 10, headerY = 10, headerW = tft.width() - 20, headerH = 55;
+    tft.fillRoundRect(headerX, headerY, headerW, headerH, 12, PANEL_DARK);
+    tft.drawRoundRect(headerX, headerY, headerW, headerH, 12, ACCENT_ORANGE);
+
+    tft.setTextColor(TEXT_WHITE);
+    if (relayStage == 2) {
+        tft.setTextSize(2);
+        tft.setCursor(centerTextX("Masukkan PIN", headerX, headerW, 2), headerY + 15);
+        tft.print("Masukkan PIN");
+    } else {
+        tft.setTextSize(3);
+        tft.setCursor(centerTextX("SAKLAR", headerX, headerW, 3), headerY + 15);
+        tft.print("SAKLAR");
+    }
+
+    if (relayStage == 0 && !relayState) {
+        drawRelayStage0_Button();
+    } else if (relayStage == 0 && relayState) {
+        drawRelayStage3_Active();
+    } else if (relayStage == 1) {
+        drawRelayStage1_Warning();
+    } else if (relayStage == 2) {
+        drawRelayStage2_PinInput();
+    } else if (relayStage == 3) {
+        drawRelayStage3_Active();
+    }
+}
+
+void drawRelayStage0_Button() {
+    tft.fillRect(10, 70, tft.width()-20, tft.height()-90, BG_COLOR);
+
+    int r = 50;
+    int btnX = tft.width() / 2;
+    int btnY = tft.height() / 2 + 30;
+
+    tft.fillCircle(btnX, btnY, r, BG_COLOR);
+    tft.drawCircle(btnX, btnY, r + 5, ACCENT_YELLOW);
+
+    tft.setTextColor(ACCENT_GREEN);
+    tft.setTextSize(3);
+    tft.setCursor(centerTextX("SAKLAR", btnX - r, r * 2, 3), btnY - 10);
+    tft.print("SAKLAR");
+
+    tft.setTextSize(1);
+    tft.setTextColor(TEXT_GRAY);
+    tft.setCursor(centerTextX("Mode: OFF", 0, tft.width(), 1), 270);
+    tft.print("Mode: OFF");
+}
+
+void drawRelayStage1_Warning() {
+    tft.fillRect(10, 70, tft.width()-20, tft.height()-90, BG_COLOR);
+
+    int centerX = tft.width() / 2;
+
+    tft.fillTriangle(centerX, 100, centerX - 50, 190, centerX + 50, 190, ACCENT_RED);
+    tft.fillRect(centerX - 5, 120, 10, 45, TEXT_WHITE);
+    tft.fillCircle(centerX, 175, 5, TEXT_WHITE);
+
+    tft.setTextSize(2);
+    tft.setTextColor(ACCENT_RED);
+    tft.setCursor(centerTextX("PERINGATAN!", 0, tft.width(), 2), 200);
+    tft.print("PERINGATAN!");
+
+    tft.setTextSize(1);
+    tft.setTextColor(TEXT_WHITE);
+    tft.setCursor(centerTextX("Saklar ini akan mematikan", 0, tft.width(), 1), 220);
+    tft.print("Saklar ini akan mematikan");
+    tft.setCursor(centerTextX("perangkat terdekat.", 0, tft.width(), 1), 230);
+    tft.print("perangkat terdekat.");
+
+    tft.setTextSize(1);
+    tft.setTextColor(TEXT_GRAY);
+    tft.setCursor(centerTextX("Sentuh layar untuk melanjutkan.", 0, tft.width(), 1), 270);
+    tft.print("Sentuh layar untuk melanjutkan.");
+}
+
+void drawRelayStage2_PinInput() {
+    tft.fillRect(10, 70, tft.width()-20, tft.height()-90, BG_COLOR);
+
+    int centerX = tft.width() / 2;
+    int inputY = 70;
+    int inputW = 180, inputH = 30;
+    int inputX = centerX - inputW / 2;
+
+    tft.fillRect(inputX, inputY, inputW, inputH, PANEL_DARK);
+    tft.drawRect(inputX, inputY, inputW, inputH, BORDER_LIGHT);
+
+    drawKeypad();
+    updateRelayScreen();
+}
+
+void drawKeypad() {
+    int keyWidth = 65, keyHeight = 45, keySpacing = 5;
+    int totalWidth = (4 * keyWidth) + (3 * keySpacing);
+    int startX = (tft.width() - totalWidth) / 2;
+    int startY = 110;
+
+    int btn2X = startX + keyWidth + keySpacing;
+    int btn3X = btn2X + keyWidth + keySpacing;
+    int btn4X = btn3X + keyWidth + keySpacing;
+
+    // Row 1
+    int row1Y = startY;
+    drawKeypadButton(startX, row1Y, keyWidth, keyHeight, "1", false);
+    drawKeypadButton(btn2X, row1Y, keyWidth, keyHeight, "2", false);
+    drawKeypadButton(btn3X, row1Y, keyWidth, keyHeight, "3", false);
+    drawKeypadButton(btn4X, row1Y, keyWidth, keyHeight, "ESC", true);
+
+    // Row 2
+    int row2Y = row1Y + keyHeight + keySpacing;
+    drawKeypadButton(startX, row2Y, keyWidth, keyHeight, "4", false);
+    drawKeypadButton(btn2X, row2Y, keyWidth, keyHeight, "5", false);
+    drawKeypadButton(btn3X, row2Y, keyWidth, keyHeight, "6", false);
+    drawKeypadButton(btn4X, row2Y, keyWidth, keyHeight, "0", false);
+
+    // Row 3
+    int row3Y = row2Y + keyHeight + keySpacing;
+    drawKeypadButton(startX, row3Y, keyWidth, keyHeight, "7", false);
+    drawKeypadButton(btn2X, row3Y, keyWidth, keyHeight, "8", false);
+    drawKeypadButton(btn3X, row3Y, keyWidth, keyHeight, "9", false);
+    drawKeypadButton(btn4X, row3Y, keyWidth, keyHeight, "ENTER", true);
+}
+
+void drawKeypadButton(int x, int y, int w, int h, String label, bool special) {
+    uint16_t bgColor = special ? (label == "ESC" ? ACCENT_ORANGE : ACCENT_GREEN) : PANEL_DARK;
+    uint16_t borderColor = special ? TEXT_WHITE : BORDER_LIGHT;
+
+    tft.fillRoundRect(x, y, w, h, 6, bgColor);
+    tft.drawRoundRect(x, y, w, h, 6, borderColor);
+
+    tft.setTextColor(TEXT_WHITE);
+    if (label.length() <= 2) {
+        tft.setTextSize(3);
+        tft.setCursor(centerTextX(label, x, w, 3), y + 11);
+    } else {
+        tft.setTextSize(2);
+        tft.setCursor(centerTextX(label, x, w, 2), y + 14);
+    }
+    tft.print(label);
+}
+
+void drawRelayStage3_Active() {
+    tft.fillRect(10, 70, tft.width()-20, tft.height()-90, BG_COLOR);
+
+    int r = 50;
+    int btnX = tft.width() / 2;
+    int btnY = tft.height() / 2 + 30;
+
+    tft.fillCircle(btnX, btnY, r, ACCENT_RED);
+    tft.drawCircle(btnX, btnY, r + 5, ACCENT_GREEN);
+
+    tft.setTextColor(TEXT_WHITE);
+    tft.setTextSize(3);
+    tft.setCursor(centerTextX("SAKLAR", btnX - r, r * 2, 3), btnY - 12);
+    tft.print("SAKLAR");
+
+    tft.setTextSize(2);
+    tft.setCursor(centerTextX("ON", btnX - r, r * 2, 2), btnY + 10);
+    tft.print("ON");
+
+    tft.setTextSize(1);
+    tft.setTextColor(ACCENT_GREEN);
+    tft.setCursor(centerTextX("Perangkat rumah aktif.", 0, tft.width(), 1), 270);
+    tft.print("Perangkat rumah aktif.");
+}
+
+void updateRelayScreen() {
+    if (tftLampMode || currentScreen != 3) return; // Jangan update jika mode lampu aktif
+
+    if (relayStage == 2) {
+        int inputW = 180, inputH = 30;
+        int inputX = tft.width() / 2 - inputW / 2;
+        int inputY = 70;
+
+        tft.fillRect(inputX + 5, inputY + 5, inputW - 10, inputH - 10, PANEL_DARK);
+
+        String displayPIN = "";
+        for (int i = 0; i < inputPIN.length(); i++) {
+            displayPIN += "*";
+        }
+
+        tft.setTextSize(3);
+        tft.setTextColor(ACCENT_CYAN);
+        tft.setCursor(centerTextX(displayPIN, inputX, inputW, 3), inputY + 5);
+        tft.print(displayPIN);
+    }
+
+    if (oldRelayState != relayState && relayStage == 0) {
+        drawRelayScreen();
+        oldRelayState = relayState;
+    }
+}
+
+void drawScreenIndicators() {
+    if (tftLampMode) return; // Jangan gambar jika mode lampu aktif
+
+    int y = 295, spacing = 25;
+    int startX = (tft.width() - 100) / 2;
+
+    for (int i = 0; i < 4; i++) {
+        int x = startX + i * spacing;
+        if (i == currentScreen) {
+            tft.fillCircle(x, y, 6, ACCENT_BLUE);
+            tft.drawCircle(x, y, 7, TEXT_WHITE);
+        } else {
+            tft.fillCircle(x, y, 4, TEXT_GRAY);
+        }
+    }
+}
+
+// ===================== ANIMATION FUNCTIONS =====================
+void animateGoogleLogo() {
+    tft.fillScreen(BG_COLOR);
+
+    int centerX = tft.width() / 2;
+    int centerY = tft.height() / 2;
+    int radiusDot = 8;
+    int radiusOrbit = 40;
+    int animDuration = 1500;
+
+    uint16_t colors[] = {ACCENT_BLUE, ACCENT_RED, ACCENT_YELLOW, ACCENT_GREEN};
+    int numSegments = 4;
+
+    int oldDotX[4], oldDotY[4];
+    for(int i=0; i<4; i++) { oldDotX[i] = -1; oldDotY[i] = -1; }
+
+    unsigned long startTime = millis();
+    unsigned long lastFrameTime = 0;
+    int targetFPS = 60;
+    int frameDelay = 1000 / targetFPS;
+
+    while (millis() - startTime < animDuration) {
+        unsigned long currentTime = millis();
+        if (currentTime - lastFrameTime < frameDelay) {
+            continue;
+        }
+        lastFrameTime = currentTime;
+
+        float progress = (float)(currentTime - startTime) / animDuration;
+        float angle = progress * 360.0;
+
+        for (int i = 0; i < numSegments; i++) {
+            if (oldDotX[i] != -1) {
+                tft.fillCircle(oldDotX[i], oldDotY[i], radiusDot + 1, BG_COLOR);
+            }
+        }
+
+        for (int i = 0; i < numSegments; i++) {
+            float dotAngle = (angle + i * 90) * (PI / 180.0);
+            int dotX = centerX + (int)(radiusOrbit * cos(dotAngle));
+            int dotY = centerY + (int)(radiusOrbit * sin(dotAngle));
+
+            tft.fillCircle(dotX, dotY, radiusDot, colors[i]);
+            oldDotX[i] = dotX;
+            oldDotY[i] = dotY;
+        }
+    }
+
+    for (int i = 0; i < numSegments; i++) {
+        tft.fillCircle(oldDotX[i], oldDotY[i], radiusDot + 1, BG_COLOR);
+    }
+    tft.fillScreen(BG_COLOR);
+}
+
+void showStartupScreen() {
+    tft.fillScreen(BG_COLOR);
+    tft.setTextColor(ACCENT_BLUE);
+    tft.setTextSize(3);
+    tft.setCursor(centerTextX("SMART", 0, tft.width(), 3), 100);
+    tft.print("SMART");
+    tft.setCursor(centerTextX("HOME", 0, tft.width(), 3), 135);
+    tft.print("HOME");
+
+    tft.setTextColor(TEXT_WHITE);
+    tft.setTextSize(2);
+    tft.setCursor(centerTextX("MONITORING", 0, tft.width(), 2), 175);
+    tft.print("MONITORING");
+    delay(1500);
+    tft.fillScreen(BG_COLOR);
+}
+
+// ===================== CALIBRATION FUNCTIONS (MODIFIED FOR OFFSET) =====================
+void handleSerialCalibration() {
+    if (Serial.available() > 0) {
+        String input = Serial.readStringUntil('\n');
+        input.trim();
+
+        if (input == "GUIDE") {
+            guideCalibration();
+        } else if (input.startsWith("CAL")) {
+            int cellNum = input.substring(3, 4).toInt();
+            int colonIndex = input.indexOf(':', 4);
+
+            if (colonIndex != -1) {
+                float realVolt = input.substring(colonIndex + 1).toFloat();
+
+                if (cellNum >= 1 && cellNum <= 3 && realVolt > 0) {
+                    Serial.println("=== ADC Offset Calibration ===");
+                    Serial.print("Calibrating Cell "); Serial.print(cellNum);
+                    Serial.print(" to "); Serial.print(realVolt, 2); Serial.println("V");
+
+                    float rawNow = 0;
+                    if (cellNum == 1) rawNow = readVoltage(CELL1_PIN, 0.0);
+                    else if (cellNum == 2) rawNow = readVoltage(CELL2_PIN, 0.0);
+                    else if (cellNum == 3) rawNow = readVoltage(CELL3_PIN, 0.0);
+
+                    float newOffset = realVolt - rawNow;
+
+                    preferences.begin("bms-cal", false);
+                    if (cellNum == 1) { offset1 = newOffset; preferences.putFloat("o1", offset1); }
+                    else if (cellNum == 2) { offset2 = newOffset; preferences.putFloat("o2", offset2); }
+                    else if (cellNum == 3) { offset3 = newOffset; preferences.putFloat("o3", offset3); }
+                    preferences.end();
+
+                    Serial.print("Cell "); Serial.print(cellNum);
+                    Serial.print(" calibrated. New Offset: "); Serial.println(newOffset, 4);
+                } else {
+                    Serial.println("Invalid CAL command format. Use: CAL[1-3]:[voltage]");
+                }
+            } else {
+                Serial.println("Invalid CAL command format. Use: CAL[1-3]:[voltage]");
+            }
+        } else if (input == "ADCSHOW") {
+            Serial.println("=== ADC Offset Status ===");
+            Serial.print("Cell1 - Offset: "); Serial.println(offset1, 6);
+            Serial.print("Cell2 - Offset: "); Serial.println(offset2, 6);
+            Serial.print("Cell3 - Offset: "); Serial.println(offset3, 6);
+        } else if (input == "ADCRESET") {
+            Serial.println("Resetting ADC offset calibration...");
+            preferences.begin("bms-cal", false);
+            offset1 = 0.0; preferences.putFloat("o1", offset1);
+            offset2 = 0.0; preferences.putFloat("o2", offset2);
+            offset3 = 0.0; preferences.putFloat("o3", offset3);
+            preferences.end();
+            Serial.println("Offsets reset to 0.0");
+        } else if (input == "WEB") {
+            Serial.println("=== Web Interface Info ===");
+            Serial.print("AP SSID: ");
+            Serial.println(ap_ssid);
+            Serial.print("AP Password: ");
+            Serial.println(ap_password);
+            Serial.print("AP IP: ");
+            Serial.println(WiFi.softAPIP().toString());
+            Serial.print("STA IP: ");
+            Serial.println(WiFi.localIP().toString());
+            Serial.println("mDNS: http://smarthome.local");
+        }
+    }
+}
+
+void guideCalibration() {
+    Serial.println("\n=== CALIBRATION GUIDE ===");
+    Serial.println("1. DISCONNECT battery from BMS");
+    Serial.println("2. Connect power supply to cell input");
+    Serial.println("3. Measure voltage AT ADC PIN (not battery) with DMM for each cell.");
+    Serial.println("4. For each cell, send serial command with the actual measured voltage.");
+    Serial.println("   Example for Cell 1 (measured 4.20V): CAL1:4.20");
+    Serial.println("   Example for Cell 2 (measured 3.85V): CAL2:3.85");
+    Serial.println("   Example for Cell 3 (measured 12.60V): CAL3:12.60 (ini untuk total baterai, bukan per cell lagi jika pakai wiring biasa)");
+    Serial.println("   Perhatikan: CAL1, CAL2, CAL3 harus sesuai dengan titik ukur di voltage divider Anda.");
+    Serial.println("5. To view current offsets: ADCSHOW");
+    Serial.println("6. To reset all offsets to 0.0: ADCRESET");
+    Serial.println("\n=== Web Interface ===");
+    Serial.println("SSID: SmartHome-Cal");
+    Serial.println("Password: calibrate123");
+    Serial.println("URL: http://" + WiFi.softAPIP().toString());
+}
+
+// ===================== TFT LAMP FUNCTIONS =====================
+void drawNightModeIndicator() {
+  tft.setTextColor(TEXT_BLACK); // Teks hitam
+  tft.setTextSize(1);
+  // Posisikan di pojok kanan atas dengan sedikit padding
+  tft.setCursor(tft.width() - getTextWidth("night mode", 1) - 5, 5);
+  tft.print("night mode");
+}
+
+void activateTFTAsLamp(uint16_t color) {
+  tftLampMode = true;
+  tftLampColor = color;
+  tft.fillScreen(tftLampColor); // Mengisi seluruh layar dengan warna yang dipilih
+  drawNightModeIndicator(); // Gambar tulisan "night mode"
+  screenNeedsRedraw = false; // Karena layar sudah di-redraw
+}
+
+void deactivateTFTAsLamp() {
+  tftLampMode = false;
+  tftLampColor = TFT_LAMP_OFF; // Reset warna ke hitam
+  tft.fillScreen(BG_COLOR); // Kembali ke background UI normal (hitam)
+  screenNeedsRedraw = true; // Paksa redraw UI utama
+}
+
